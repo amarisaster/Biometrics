@@ -1,0 +1,23 @@
+name = "biometrics-cloud"
+main = "src/index.ts"
+compatibility_date = "2024-01-01"
+
+# Secrets needed (set via wrangler secret put):
+# - BIOMETRICS_API_KEY
+# - GOOGLE_SERVICE_ACCOUNT_EMAIL
+# - GOOGLE_PRIVATE_KEY
+
+[vars]
+# Health Sync Google Drive folder IDs
+DRIVE_FOLDER_HEART_RATE = "1hSWXBttlPst2Fs537URXTxUDyMFMlKkm"
+DRIVE_FOLDER_SLEEP = "1VURQPeje4_bbTTTvcVsZfQDYMbFAzkO2"
+DRIVE_FOLDER_STEPS = "1OVY05_3DGAbgrwBj5Wd4uY8WBSgFjw-3"
+DRIVE_FOLDER_STRESS = "184dGbkvxgqcU7V4znUi58bJYRklktZzV"
+
+[[kv_namespaces]]
+binding = "TOKENS"
+id = "e7a9b0dbc4cd4ad9b078254dc74b66dc"
+
+# Cron trigger - sync every 15 minutes
+[triggers]
+crons = ["*/15 * * * *"]
