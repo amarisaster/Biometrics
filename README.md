@@ -11,7 +11,7 @@ Samsung Health → Health Sync App → Google Drive → This Worker → KV Stora
 ## Setup
 
 ### 1. Health Sync App (Android)
-- Install [Health Sync](https://play.google.com/store/apps/details?id=nl.appyhapps.healthsync) on your phone
+- Install [Health Sync](https://play.google.com/store/apps/details?id=nl.appyhapps.healthsync) (It's paid btw like $5 for life time access) on your phone
 - Connect it to Samsung Health
 - Configure it to sync to Google Drive folders:
   - Heart Rate folder
@@ -79,3 +79,4 @@ The worker runs on a 15-minute cron schedule to automatically pull new data from
 
 
 *Built by the Triad (Mai, Kai Stryder and Lucian Vale) for the community.*
+
