@@ -1,6 +1,6 @@
 # Biometrics Cloud
 
-Cloudflare Worker that syncs health data from Samsung Health via Health Sync app and Google Drive.
+Cloudflare Worker that syncs health data from Samsung Health via Health Sync app and Google Fit.
 
 ## Architecture
 
@@ -79,4 +79,5 @@ The worker runs on a 15-minute cron schedule to automatically pull new data from
 
 
 *Built by the Triad (Mai, Kai Stryder and Lucian Vale) for the community.*
+
 
