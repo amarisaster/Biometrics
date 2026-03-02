@@ -1,14 +1,10 @@
 interface Env {
   BIOMETRICS_API_KEY: string;
   TOKENS: KVNamespace;
-  // Google Drive service account
-  GOOGLE_SERVICE_ACCOUNT_EMAIL: string;
-  GOOGLE_PRIVATE_KEY: string;
-  // Drive folder IDs
-  DRIVE_FOLDER_HEART_RATE: string;
-  DRIVE_FOLDER_SLEEP: string;
-  DRIVE_FOLDER_STEPS: string;
-  DRIVE_FOLDER_STRESS: string;
+  // Google OAuth (for Fitness API)
+  GOOGLE_CLIENT_ID: string;
+  GOOGLE_CLIENT_SECRET: string;
+  GOOGLE_FIT_REFRESH_TOKEN: string;
 }
 
 // Types for health data
@@ -69,302 +65,292 @@ interface McpResponse {
   error?: { code: number; message: string };
 }
 
-// ========== Google Drive Integration ==========
+// ========== Google Fit Integration ==========
 
-// Create JWT for Google Service Account auth
-async function createGoogleJwt(email: string, privateKey: string): Promise<string> {
-  const header = { alg: 'RS256', typ: 'JWT' };
-  const now = Math.floor(Date.now() / 1000);
-  const payload = {
-    iss: email,
-    scope: 'https://www.googleapis.com/auth/drive.readonly',
-    aud: 'https://oauth2.googleapis.com/token',
-    exp: now + 3600,
-    iat: now,
-  };
+// Get OAuth access token using refresh token
+async function getFitAccessToken(env: Env): Promise<string> {
+  // Try KV cache first (avoids hitting Google on every request)
+  const cached = await env.TOKENS.get('fit_access_token');
+  if (cached) return cached;
 
-  const encoder = new TextEncoder();
-  const headerB64 = btoa(JSON.stringify(header)).replace(/=/g, '').replace(/\+/g, '-').replace(/\//g, '_');
-  const payloadB64 = btoa(JSON.stringify(payload)).replace(/=/g, '').replace(/\+/g, '-').replace(/\//g, '_');
-  const signatureInput = `${headerB64}.${payloadB64}`;
-
-  // Import the private key - handle both actual newlines and literal \n
-  const normalizedKey = privateKey.replace(/\\n/g, '\n');
-  const pemContents = normalizedKey
-    .replace(/-----BEGIN PRIVATE KEY-----/g, '')
-    .replace(/-----END PRIVATE KEY-----/g, '')
-    .replace(/[\r\n\s]/g, '');
-  const binaryKey = Uint8Array.from(atob(pemContents), c => c.charCodeAt(0));
-
-  const cryptoKey = await crypto.subtle.importKey(
-    'pkcs8',
-    binaryKey,
-    { name: 'RSASSA-PKCS1-v1_5', hash: 'SHA-256' },
-    false,
-    ['sign']
-  );
-
-  const signature = await crypto.subtle.sign(
-    'RSASSA-PKCS1-v1_5',
-    cryptoKey,
-    encoder.encode(signatureInput)
-  );
-
-  const signatureB64 = btoa(String.fromCharCode(...new Uint8Array(signature)))
-    .replace(/=/g, '').replace(/\+/g, '-').replace(/\//g, '_');
-
-  return `${signatureInput}.${signatureB64}`;
-}
-
-// Get Google access token
-async function getGoogleAccessToken(env: Env): Promise<string> {
-  const jwt = await createGoogleJwt(env.GOOGLE_SERVICE_ACCOUNT_EMAIL, env.GOOGLE_PRIVATE_KEY);
+  // Refresh token: prefer KV (stored cleanly by callback) over env secret
+  const rawToken = await env.TOKENS.get('google_fit_refresh_token') || env.GOOGLE_FIT_REFRESH_TOKEN;
+  if (!rawToken) throw new Error('No Google Fit refresh token configured');
+  const refreshToken = rawToken.trim();
 
   const response = await fetch('https://oauth2.googleapis.com/token', {
     method: 'POST',
     headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
-    body: `grant_type=urn:ietf:params:oauth:grant-type:jwt-bearer&assertion=${jwt}`,
+    body: new URLSearchParams({
+      client_id: env.GOOGLE_CLIENT_ID,
+      client_secret: env.GOOGLE_CLIENT_SECRET,
+      refresh_token: refreshToken,
+      grant_type: 'refresh_token',
+    }),
   });
 
   if (!response.ok) {
     const error = await response.text();
-    throw new Error(`Failed to get access token: ${error}`);
+    throw new Error(`Failed to refresh access token: ${error}`);
   }
 
-  const data = await response.json() as { access_token: string };
+  const data = await response.json() as { access_token: string; expires_in: number };
+  // Cache with some buffer before expiry
+  await env.TOKENS.put('fit_access_token', data.access_token, { expirationTtl: Math.max(data.expires_in - 120, 300) });
   return data.access_token;
 }
 
-// List files in a Drive folder (only get most recent 2 files)
-async function listDriveFiles(accessToken: string, folderId: string): Promise<Array<{ id: string; name: string; modifiedTime: string }>> {
-  // Filter by .csv extension in name since mimeType detection is unreliable
-  const query = encodeURIComponent(`'${folderId}' in parents and name contains '.csv'`);
+// Query raw data from a Google Fit data source
+interface FitPoint {
+  startTimeNanos: string;
+  endTimeNanos: string;
+  value: Array<{ intVal?: number; fpVal?: number }>;
+}
+
+async function queryFitRaw(
+  accessToken: string,
+  dataSourceId: string,
+  startMs: number,
+  endMs: number,
+): Promise<FitPoint[]> {
+  const startNanos = startMs * 1e6;
+  const endNanos = endMs * 1e6;
+  const encodedSource = encodeURIComponent(dataSourceId);
+
   const response = await fetch(
-    `https://www.googleapis.com/drive/v3/files?q=${query}&fields=files(id,name,modifiedTime)&orderBy=modifiedTime desc&pageSize=2`,
-    { headers: { Authorization: `Bearer ${accessToken}` } }
+    `https://www.googleapis.com/fitness/v1/users/me/dataSources/${encodedSource}/datasets/${startNanos}-${endNanos}`,
+    { headers: { Authorization: `Bearer ${accessToken}` } },
   );
 
   if (!response.ok) {
     const error = await response.text();
-    throw new Error(`Failed to list files: ${error}`);
+    throw new Error(`Fit API error (${dataSourceId}): ${error}`);
   }
 
-  const data = await response.json() as { files: Array<{ id: string; name: string; modifiedTime: string }> };
-  return data.files || [];
+  const data = await response.json() as { point?: FitPoint[] };
+  return data.point || [];
 }
 
-// Download file content from Drive
-async function downloadDriveFile(accessToken: string, fileId: string): Promise<string> {
-  const response = await fetch(
-    `https://www.googleapis.com/drive/v3/files/${fileId}?alt=media`,
-    { headers: { Authorization: `Bearer ${accessToken}` } }
-  );
+// Data source IDs
+const FIT_SOURCES = {
+  heartRate: 'derived:com.google.heart_rate.bpm:com.google.android.gms:merge_heart_rate_bpm',
+  sleep: 'raw:com.google.sleep.segment:nl.appyhapps.healthsync:',
+  steps: 'derived:com.google.step_count.delta:com.google.android.gms:merge_step_deltas',
+};
 
-  if (!response.ok) {
-    throw new Error(`Failed to download file: ${response.status}`);
-  }
+// Sync heart rate from Google Fit
+async function syncHeartRate(accessToken: string, env: Env, now: number): Promise<number> {
+  const dayMs = 24 * 60 * 60 * 1000;
+  const points = await queryFitRaw(accessToken, FIT_SOURCES.heartRate, now - dayMs, now);
+  const readings: Array<{ timestamp: string; data: unknown }> = [];
 
-  return response.text();
-}
-
-// Parse Health Sync heart rate CSV
-function parseHeartRateCsv(csv: string): HeartRateReading[] {
-  const lines = csv.trim().split('\n');
-  const readings: HeartRateReading[] = [];
-
-  // Skip header: Date,Time,Heart rate,Source
-  for (let i = 1; i < lines.length; i++) {
-    const cols = lines[i].split(',');
-    if (cols.length >= 3) {
-      // Date format: 2026.01.24 00:00:00 -> ISO format
-      // Already has full time, just need to fix separators
-      const dateStr = cols[0].replace(/\./g, '-').replace(' ', 'T') + '.000Z';
-      const bpm = parseInt(cols[2], 10);
-      if (!isNaN(bpm)) {
-        readings.push({ timestamp: dateStr, bpm });
-      }
+  for (const point of points) {
+    const timestamp = new Date(parseInt(point.startTimeNanos) / 1e6).toISOString();
+    const bpm = Math.round(point.value[0]?.fpVal || point.value[0]?.intVal || 0);
+    if (bpm > 0) {
+      readings.push({
+        timestamp,
+        data: { timestamp, bpm } as HeartRateReading,
+      });
     }
   }
 
-  return readings;
+  if (readings.length > 0) {
+    await storeBatchReadings(env, 'heart_rate', readings);
+  }
+  return readings.length;
 }
 
-// Parse Health Sync sleep CSV
-function parseSleepCsv(csv: string): SleepReading | null {
-  const lines = csv.trim().split('\n');
-  if (lines.length < 2) return null;
+// Sync sleep from Google Fit
+async function syncSleep(accessToken: string, env: Env, now: number): Promise<number> {
+  const dayMs = 24 * 60 * 60 * 1000;
+  const points = await queryFitRaw(accessToken, FIT_SOURCES.sleep, now - 2 * dayMs, now);
 
-  // Aggregate sleep stages
-  let totalMinutes = 0;
-  let awakeMinutes = 0;
-  let lightMinutes = 0;
-  let deepMinutes = 0;
-  let remMinutes = 0;
-  let startTime: string | null = null;
-  let endTime: string | null = null;
+  if (points.length === 0) return 0;
 
-  // Skip header: Date,Time,Duration in seconds,Sleep stage
-  for (let i = 1; i < lines.length; i++) {
-    const cols = lines[i].split(',');
-    if (cols.length >= 4) {
-      const dateStr = cols[0].replace(/\./g, '-').replace(' ', 'T') + '.000Z';
-      const durationSec = parseInt(cols[2], 10);
-      const stage = cols[3].toLowerCase().trim();
+  // Collect all segments
+  const segments = points.map(p => ({
+    start: parseInt(p.startTimeNanos) / 1e6,
+    end: parseInt(p.endTimeNanos) / 1e6,
+    stage: p.value[0]?.intVal || 0,
+  }));
 
-      if (!startTime) startTime = dateStr;
-      endTime = dateStr;
+  // Sort by start time
+  segments.sort((a, b) => a.start - b.start);
 
-      const durationMin = durationSec / 60;
+  // Group into sleep sessions (gaps > 2 hours = new session)
+  const sessions: (typeof segments)[] = [[]];
+  for (const seg of segments) {
+    const current = sessions[sessions.length - 1];
+    if (current.length > 0 && seg.start - current[current.length - 1].end > 2 * 60 * 60 * 1000) {
+      sessions.push([]);
+    }
+    sessions[sessions.length - 1].push(seg);
+  }
+
+  const sleepReadings: Array<{ timestamp: string; data: unknown }> = [];
+  for (const session of sessions) {
+    if (session.length === 0) continue;
+
+    let totalMinutes = 0, awakeMinutes = 0, lightMinutes = 0, deepMinutes = 0, remMinutes = 0;
+    const startTime = new Date(session[0].start).toISOString();
+    const endTime = new Date(session[session.length - 1].end).toISOString();
+
+    for (const seg of session) {
+      const durationMin = (seg.end - seg.start) / 60000;
       totalMinutes += durationMin;
-
-      switch (stage) {
-        case 'awake': awakeMinutes += durationMin; break;
-        case 'light': lightMinutes += durationMin; break;
-        case 'deep': deepMinutes += durationMin; break;
-        case 'rem': remMinutes += durationMin; break;
+      // Google Fit sleep stages: 1=Awake, 2=Sleep, 3=Out-of-bed, 4=Light, 5=Deep, 6=REM
+      switch (seg.stage) {
+        case 1: case 3: awakeMinutes += durationMin; break;
+        case 2: case 4: lightMinutes += durationMin; break;
+        case 5: deepMinutes += durationMin; break;
+        case 6: remMinutes += durationMin; break;
       }
+    }
+
+    sleepReadings.push({
+      timestamp: endTime,
+      data: {
+        timestamp: endTime,
+        start_time: startTime,
+        end_time: endTime,
+        total_minutes: Math.round(totalMinutes),
+        stages: {
+          awake_minutes: Math.round(awakeMinutes),
+          light_minutes: Math.round(lightMinutes),
+          deep_minutes: Math.round(deepMinutes),
+          rem_minutes: Math.round(remMinutes),
+        },
+      } as SleepReading,
+    });
+  }
+
+  if (sleepReadings.length > 0) {
+    await storeBatchReadings(env, 'sleep', sleepReadings);
+  }
+  return sleepReadings.length;
+}
+
+// Sync steps from Google Fit
+async function syncSteps(accessToken: string, env: Env, now: number): Promise<number> {
+  const dayMs = 24 * 60 * 60 * 1000;
+  const points = await queryFitRaw(accessToken, FIT_SOURCES.steps, now - 2 * dayMs, now);
+  const readings: Array<{ timestamp: string; data: unknown }> = [];
+
+  // Aggregate step deltas by day
+  const dailySteps: Record<string, number> = {};
+  for (const point of points) {
+    const timestamp = new Date(parseInt(point.startTimeNanos) / 1e6);
+    const date = timestamp.toISOString().split('T')[0];
+    const count = point.value[0]?.intVal || 0;
+    dailySteps[date] = (dailySteps[date] || 0) + count;
+  }
+
+  for (const [date, count] of Object.entries(dailySteps)) {
+    if (count > 0) {
+      const timestamp = `${date}T00:00:00.000Z`;
+      readings.push({
+        timestamp,
+        data: { timestamp, count } as StepsReading,
+      });
     }
   }
 
-  if (!startTime || !endTime) return null;
-
-  return {
-    timestamp: endTime,
-    start_time: startTime,
-    end_time: endTime,
-    total_minutes: Math.round(totalMinutes),
-    stages: {
-      awake_minutes: Math.round(awakeMinutes),
-      light_minutes: Math.round(lightMinutes),
-      deep_minutes: Math.round(deepMinutes),
-      rem_minutes: Math.round(remMinutes),
-    },
-  };
-}
-
-// Parse Health Sync steps CSV (similar format to heart rate)
-function parseStepsCsv(csv: string): StepsReading[] {
-  const lines = csv.trim().split('\n');
-  const readings: StepsReading[] = [];
-
-  // Skip header
-  for (let i = 1; i < lines.length; i++) {
-    const cols = lines[i].split(',');
-    if (cols.length >= 3) {
-      const dateStr = cols[0].replace(/\./g, '-').replace(' ', 'T') + '.000Z';
-      const count = parseInt(cols[2], 10);
-      if (!isNaN(count)) {
-        readings.push({ timestamp: dateStr, count });
-      }
-    }
+  if (readings.length > 0) {
+    await storeBatchReadings(env, 'steps', readings);
   }
-
-  return readings;
+  return readings.length;
 }
 
-// Sync data from Google Drive
-async function syncFromDrive(env: Env, force: boolean = false): Promise<{ heart_rate: number; sleep: number; steps: number; debug?: string }> {
-  const accessToken = await getGoogleAccessToken(env);
+// Main sync function
+async function syncFromGoogleFit(env: Env): Promise<{ heart_rate: number; sleep: number; steps: number }> {
+  const accessToken = await getFitAccessToken(env);
+  const now = Date.now();
+
   let hrCount = 0, sleepCount = 0, stepsCount = 0;
 
-  // Get last sync time (or epoch if force)
-  const lastSyncStr = force ? null : await env.TOKENS.get('drive_last_sync');
-  const lastSync = lastSyncStr ? new Date(lastSyncStr) : new Date(0);
-
-  // Sync heart rate (limit to most recent 200 readings to avoid rate limits)
-  if (env.DRIVE_FOLDER_HEART_RATE) {
-    const files = await listDriveFiles(accessToken, env.DRIVE_FOLDER_HEART_RATE);
-    for (const file of files) {
-      if (new Date(file.modifiedTime) > lastSync) {
-        const csv = await downloadDriveFile(accessToken, file.id);
-        const readings = parseHeartRateCsv(csv).slice(0, 200);
-        for (const reading of readings) {
-          await storeReading(env, { type: 'heart_rate', timestamp: reading.timestamp, data: reading });
-          hrCount++;
-        }
-      }
-    }
+  try { hrCount = await syncHeartRate(accessToken, env, now); } catch (e) {
+    console.error('Heart rate sync failed:', e);
+  }
+  try { sleepCount = await syncSleep(accessToken, env, now); } catch (e) {
+    console.error('Sleep sync failed:', e);
+  }
+  try { stepsCount = await syncSteps(accessToken, env, now); } catch (e) {
+    console.error('Steps sync failed:', e);
   }
 
-  // Sync sleep
-  if (env.DRIVE_FOLDER_SLEEP) {
-    const files = await listDriveFiles(accessToken, env.DRIVE_FOLDER_SLEEP);
-    for (const file of files) {
-      if (new Date(file.modifiedTime) > lastSync) {
-        const csv = await downloadDriveFile(accessToken, file.id);
-        const reading = parseSleepCsv(csv);
-        if (reading) {
-          await storeReading(env, { type: 'sleep', timestamp: reading.timestamp, data: reading });
-          sleepCount++;
-        }
-      }
-    }
-  }
-
-  // Sync steps (limit to most recent 100 readings)
-  if (env.DRIVE_FOLDER_STEPS) {
-    const files = await listDriveFiles(accessToken, env.DRIVE_FOLDER_STEPS);
-    for (const file of files) {
-      if (new Date(file.modifiedTime) > lastSync) {
-        const csv = await downloadDriveFile(accessToken, file.id);
-        const readings = parseStepsCsv(csv).slice(0, 100);
-        for (const reading of readings) {
-          await storeReading(env, { type: 'steps', timestamp: reading.timestamp, data: reading });
-          stepsCount++;
-        }
-      }
-    }
-  }
-
-  // Update last sync time
-  await env.TOKENS.put('drive_last_sync', new Date().toISOString());
-
+  await env.TOKENS.put('fit_last_sync', new Date().toISOString());
   return { heart_rate: hrCount, sleep: sleepCount, steps: stepsCount };
 }
 
-// ========== KV Storage ==========
+// ========== KV Storage (batch-optimized) ==========
 
-function getKvKey(type: string, timestamp: string): string {
-  return `reading:${type}:${timestamp}`;
+const KV_TTL = 30 * 24 * 60 * 60; // 30 days
+
+function batchKey(type: string, date: string): string {
+  return `batch:${type}:${date}`;
 }
 
-function getKvPrefix(type: string): string {
-  return `reading:${type}:`;
+// Store multiple readings efficiently — groups by date, one KV write per date
+async function storeBatchReadings(env: Env, type: string, newReadings: Array<{ timestamp: string; data: unknown }>): Promise<void> {
+  if (newReadings.length === 0) return;
+
+  // Group by date
+  const byDate: Record<string, Array<{ timestamp: string; data: unknown }>> = {};
+  for (const r of newReadings) {
+    const date = r.timestamp.split('T')[0];
+    if (!byDate[date]) byDate[date] = [];
+    byDate[date].push(r);
+  }
+
+  // Read-merge-write per date (1 read + 1 write per date instead of N writes)
+  for (const [date, readings] of Object.entries(byDate)) {
+    const key = batchKey(type, date);
+    const existing = await env.TOKENS.get(key);
+    const existingReadings: Array<{ timestamp: string; data: unknown }> = existing ? JSON.parse(existing) : [];
+
+    const existingTimestamps = new Set(existingReadings.map(r => r.timestamp));
+    const merged = [...existingReadings, ...readings.filter(r => !existingTimestamps.has(r.timestamp))];
+
+    await env.TOKENS.put(key, JSON.stringify(merged), { expirationTtl: KV_TTL });
+  }
+
+  // Update latest pointer
+  const sorted = [...newReadings].sort((a, b) => b.timestamp.localeCompare(a.timestamp));
+  await env.TOKENS.put(`latest:${type}`, JSON.stringify({
+    timestamp: sorted[0].timestamp,
+    data: sorted[0].data,
+  }), { expirationTtl: KV_TTL });
 }
 
+// Single-reading convenience wrapper (for /push endpoint)
 async function storeReading(env: Env, payload: PushPayload): Promise<void> {
-  const key = getKvKey(payload.type, payload.timestamp);
-  const ttl = 30 * 24 * 60 * 60; // 30 days
-  await env.TOKENS.put(key, JSON.stringify(payload.data), { expirationTtl: ttl });
-
-  await env.TOKENS.put(`latest:${payload.type}`, JSON.stringify({
-    timestamp: payload.timestamp,
-    data: payload.data,
-  }), { expirationTtl: ttl });
+  await storeBatchReadings(env, payload.type, [{ timestamp: payload.timestamp, data: payload.data }]);
 }
 
+// Read from daily batch keys — 1-2 KV reads instead of N+1
 async function getReadings(env: Env, type: string, hours: number = 24): Promise<Array<{ timestamp: string; data: unknown }>> {
   const readings: Array<{ timestamp: string; data: unknown }> = [];
-  const cutoffTime = new Date(Date.now() - hours * 60 * 60 * 1000).toISOString();
+  const cutoff = new Date(Date.now() - hours * 60 * 60 * 1000);
 
-  const prefix = getKvPrefix(type);
-  let cursor: string | undefined;
+  // Calculate which dates to fetch
+  const dates: string[] = [];
+  const d = new Date(cutoff);
+  d.setUTCHours(0, 0, 0, 0);
+  const now = new Date();
+  while (d <= now) {
+    dates.push(d.toISOString().split('T')[0]);
+    d.setUTCDate(d.getUTCDate() + 1);
+  }
 
-  do {
-    const result = await env.TOKENS.list({ prefix, cursor });
-
-    for (const key of result.keys) {
-      const timestamp = key.name.replace(prefix, '');
-      if (timestamp >= cutoffTime) {
-        const value = await env.TOKENS.get(key.name);
-        if (value) {
-          readings.push({ timestamp, data: JSON.parse(value) });
-        }
-      }
+  // Read one batch key per date
+  for (const date of dates) {
+    const value = await env.TOKENS.get(batchKey(type, date));
+    if (value) {
+      const batch: Array<{ timestamp: string; data: unknown }> = JSON.parse(value);
+      readings.push(...batch.filter(r => new Date(r.timestamp) >= cutoff));
     }
-
-    cursor = result.list_complete ? undefined : result.cursor;
-  } while (cursor);
+  }
 
   readings.sort((a, b) => b.timestamp.localeCompare(a.timestamp));
   return readings;
@@ -392,7 +378,7 @@ async function getHeartRate(env: Env, hours: number = 24): Promise<unknown> {
     history,
     period_hours: hours,
     total_readings: readings.length,
-    source: 'health_sync_drive',
+    source: 'google_fit',
   };
 }
 
@@ -419,7 +405,7 @@ async function getSleep(env: Env, days: number = 1): Promise<unknown> {
     latest: sessions[0] || null,
     sessions: sessions.slice(0, 7),
     period_days: days,
-    source: 'health_sync_drive',
+    source: 'google_fit',
   };
 }
 
@@ -451,7 +437,7 @@ async function getSteps(env: Env, days: number = 1): Promise<unknown> {
     today: today?.steps || 0,
     history,
     period_days: days,
-    source: 'health_sync_drive',
+    source: 'google_fit',
   };
 }
 
@@ -463,7 +449,8 @@ async function getStress(env: Env, hours: number = 24): Promise<unknown> {
     latest: latest ? { time: latest.timestamp, level: (latest.data as StressReading).level } : null,
     history: readings.slice(0, 20).map(r => ({ time: r.timestamp, level: (r.data as StressReading).level })),
     period_hours: hours,
-    source: 'health_sync_drive',
+    source: 'google_fit',
+    note: 'Stress data not available from Google Fit — showing cached data from previous Drive syncs if any',
   };
 }
 
@@ -472,7 +459,7 @@ async function getStress(env: Env, hours: number = 24): Promise<unknown> {
 const TOOLS = [
   {
     name: 'biometrics_heart_rate',
-    description: "Get Mai's heart rate data from her Galaxy Fit3 via Health Sync",
+    description: "Get Mai's heart rate data from her Galaxy Fit3 via Google Fit",
     inputSchema: {
       type: 'object',
       properties: {
@@ -482,7 +469,7 @@ const TOOLS = [
   },
   {
     name: 'biometrics_sleep',
-    description: "Get Mai's sleep data - duration and stages (light, deep, REM, awake)",
+    description: "Get Mai's sleep data - duration and stages (light, deep, REM, awake) via Google Fit",
     inputSchema: {
       type: 'object',
       properties: {
@@ -492,7 +479,7 @@ const TOOLS = [
   },
   {
     name: 'biometrics_steps',
-    description: "Get Mai's step count",
+    description: "Get Mai's step count via Google Fit",
     inputSchema: {
       type: 'object',
       properties: {
@@ -502,7 +489,7 @@ const TOOLS = [
   },
   {
     name: 'biometrics_stress',
-    description: "Get Mai's stress level data",
+    description: "Get Mai's stress level data (cached — not available via Google Fit)",
     inputSchema: {
       type: 'object',
       properties: {
@@ -517,7 +504,7 @@ const TOOLS = [
   },
   {
     name: 'biometrics_sync',
-    description: "Trigger a manual sync from Google Drive",
+    description: "Trigger a manual sync from Google Fit",
     inputSchema: { type: 'object', properties: {} },
   },
 ];
@@ -533,17 +520,17 @@ async function handleToolCall(env: Env, name: string, args: Record<string, unkno
     case 'biometrics_stress':
       return getStress(env, (args.hours as number) || 24);
     case 'biometrics_sync':
-      return syncFromDrive(env);
+      return syncFromGoogleFit(env);
     case 'biometrics_status': {
       const latestHr = await getLatestReading(env, 'heart_rate');
       const latestSleep = await getLatestReading(env, 'sleep');
       const latestSteps = await getLatestReading(env, 'steps');
-      const lastDriveSync = await env.TOKENS.get('drive_last_sync');
+      const lastFitSync = await env.TOKENS.get('fit_last_sync');
 
       return {
         connected: true,
-        source: 'health_sync_drive',
-        last_drive_sync: lastDriveSync || null,
+        source: 'google_fit',
+        last_sync: lastFitSync || null,
         data_available: {
           heart_rate: !!latestHr,
           sleep: !!latestSleep,
@@ -572,7 +559,7 @@ async function processMcpRequest(env: Env, request: McpRequest): Promise<McpResp
           result: {
             protocolVersion: '2024-11-05',
             capabilities: { tools: {} },
-            serverInfo: { name: 'biometrics-cloud', version: '3.0.0' },
+            serverInfo: { name: 'biometrics-cloud', version: '4.0.0' },
           },
         };
       case 'tools/list':
@@ -614,15 +601,15 @@ export default {
     // Health check
     if (url.pathname === '/health') {
       const latestHr = await getLatestReading(env, 'heart_rate');
-      const lastSync = await env.TOKENS.get('drive_last_sync');
+      const lastSync = await env.TOKENS.get('fit_last_sync');
       return new Response(JSON.stringify({
         status: 'ok',
         service: 'biometrics-cloud',
-        version: '3.0.0',
-        source: 'health_sync_drive',
+        version: '4.0.0',
+        source: 'google_fit',
         has_data: !!latestHr,
         last_reading: latestHr?.timestamp || null,
-        last_drive_sync: lastSync || null,
+        last_sync: lastSync || null,
       }), { headers: { 'Content-Type': 'application/json', ...corsHeaders } });
     }
 
@@ -635,8 +622,7 @@ export default {
       }
 
       try {
-        const force = url.searchParams.get('force') === 'true';
-        const result = await syncFromDrive(env, force);
+        const result = await syncFromGoogleFit(env);
         return new Response(JSON.stringify({ success: true, synced: result }), {
           headers: { 'Content-Type': 'application/json', ...corsHeaders },
         });
@@ -647,7 +633,7 @@ export default {
       }
     }
 
-    // Push endpoint (legacy - keep for Android app if needed)
+    // Push endpoint (legacy - keep for external integrations)
     if (url.pathname === '/push' && request.method === 'POST') {
       if (!validateApiKey(request, env)) {
         return new Response(JSON.stringify({ error: 'Unauthorized' }), {
@@ -660,8 +646,13 @@ export default {
 
         if ('readings' in body) {
           const batch = body as BatchPushPayload;
-          for (const reading of batch.readings) {
-            await storeReading(env, reading);
+          const byType: Record<string, Array<{ timestamp: string; data: unknown }>> = {};
+          for (const r of batch.readings) {
+            if (!byType[r.type]) byType[r.type] = [];
+            byType[r.type].push({ timestamp: r.timestamp, data: r.data });
+          }
+          for (const [type, readings] of Object.entries(byType)) {
+            await storeBatchReadings(env, type, readings);
           }
           return new Response(JSON.stringify({ success: true, stored: batch.readings.length }), {
             headers: { 'Content-Type': 'application/json', ...corsHeaders },
@@ -703,44 +694,89 @@ export default {
       });
     }
 
-    // Debug: list files in a folder
-    if (url.pathname === '/debug/files' && request.method === 'GET') {
-      if (!validateApiKey(request, env)) {
-        return new Response(JSON.stringify({ error: 'Unauthorized' }), {
-          status: 401, headers: { 'Content-Type': 'application/json', ...corsHeaders },
+    // OAuth: start consent flow (keep for re-auth if token expires)
+    if (url.pathname === '/auth') {
+      const scopes = [
+        'https://www.googleapis.com/auth/fitness.heart_rate.read',
+        'https://www.googleapis.com/auth/fitness.sleep.read',
+        'https://www.googleapis.com/auth/fitness.activity.read',
+        'https://www.googleapis.com/auth/fitness.body.read',
+      ].join(' ');
+
+      const params = new URLSearchParams({
+        client_id: env.GOOGLE_CLIENT_ID,
+        redirect_uri: `${url.origin}/callback`,
+        response_type: 'code',
+        scope: scopes,
+        access_type: 'offline',
+        prompt: 'consent',
+      });
+
+      return Response.redirect(`https://accounts.google.com/o/oauth2/v2/auth?${params}`, 302);
+    }
+
+    // OAuth: callback
+    if (url.pathname === '/callback') {
+      const code = url.searchParams.get('code');
+      const error = url.searchParams.get('error');
+
+      if (error) {
+        return new Response(`OAuth error: ${error}`, { status: 400, headers: corsHeaders });
+      }
+      if (!code) {
+        return new Response('Missing authorization code', { status: 400, headers: corsHeaders });
+      }
+
+      const tokenResponse = await fetch('https://oauth2.googleapis.com/token', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+        body: new URLSearchParams({
+          code,
+          client_id: env.GOOGLE_CLIENT_ID,
+          client_secret: env.GOOGLE_CLIENT_SECRET,
+          redirect_uri: `${url.origin}/callback`,
+          grant_type: 'authorization_code',
+        }),
+      });
+
+      const tokenData = await tokenResponse.json() as {
+        access_token?: string;
+        refresh_token?: string;
+        error?: string;
+        error_description?: string;
+      };
+
+      if (tokenData.error) {
+        return new Response(`Token exchange failed: ${tokenData.error_description || tokenData.error}`, {
+          status: 400, headers: corsHeaders,
         });
       }
 
-      try {
-        const accessToken = await getGoogleAccessToken(env);
-        const folderId = url.searchParams.get('folder') || env.DRIVE_FOLDER_HEART_RATE;
-
-        // List ALL files, not just CSVs
-        const query = encodeURIComponent(`'${folderId}' in parents`);
-        const response = await fetch(
-          `https://www.googleapis.com/drive/v3/files?q=${query}&fields=files(id,name,mimeType,modifiedTime)&orderBy=modifiedTime desc&pageSize=20`,
-          { headers: { Authorization: `Bearer ${accessToken}` } }
-        );
-
-        const data = await response.json();
-        return new Response(JSON.stringify({ folderId, ...data }, null, 2), {
-          headers: { 'Content-Type': 'application/json', ...corsHeaders },
-        });
-      } catch (e) {
-        return new Response(JSON.stringify({ error: e instanceof Error ? e.message : String(e) }), {
-          status: 500, headers: { 'Content-Type': 'application/json', ...corsHeaders },
+      if (!tokenData.refresh_token) {
+        return new Response('No refresh token received. Revoke at https://myaccount.google.com/permissions and retry /auth', {
+          status: 400, headers: corsHeaders,
         });
       }
+
+      await env.TOKENS.put('google_fit_refresh_token', tokenData.refresh_token);
+
+      return new Response(
+        `<html><body style="background:#0c0a09;color:#a8a29e;font-family:monospace;padding:40px;">
+          <h2 style="color:#d4748a;">OAuth Complete</h2>
+          <p>Refresh token stored. Run <code>wrangler secret put GOOGLE_FIT_REFRESH_TOKEN</code> to persist.</p>
+        </body></html>`,
+        { headers: { 'Content-Type': 'text/html', ...corsHeaders } },
+      );
     }
 
     // Info page
     if (url.pathname === '/') {
       const latestHr = await getLatestReading(env, 'heart_rate');
-      const lastSync = await env.TOKENS.get('drive_last_sync');
+      const lastSync = await env.TOKENS.get('fit_last_sync');
       return new Response(JSON.stringify({
         service: 'Biometrics Cloud MCP',
-        version: '3.0.0',
-        source: 'health_sync_drive',
+        version: '4.0.0',
+        source: 'google_fit',
         has_data: !!latestHr,
         last_sync: lastSync || null,
         endpoints: {
@@ -757,8 +793,8 @@ export default {
     return new Response('Not found', { status: 404, headers: corsHeaders });
   },
 
-  // Cron handler - runs every 15 minutes
+  // Cron handler — syncs from Google Fit every 15 minutes
   async scheduled(event: ScheduledEvent, env: Env, ctx: ExecutionContext): Promise<void> {
-    ctx.waitUntil(syncFromDrive(env));
+    ctx.waitUntil(syncFromGoogleFit(env));
   },
 };
