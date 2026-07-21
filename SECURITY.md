@@ -51,6 +51,10 @@ Google Drive acts as the bridge between your phone and the cloud worker. The wor
 
 > **What this means:** The Health Sync app writes to your Drive. The worker reads from your Drive. Google's security protects the data in transit and at rest. You're leveraging infrastructure you already trust.
 
+### Endpoint Access — set `BIOMETRICS_API_KEY`
+
+Every data endpoint requires it: `/sync`, `/push`, **and the MCP transports `/mcp` + `/sse`** (which expose your biometric data). Send it as `X-API-Key: <key>`, `Authorization: Bearer <key>`, or `?k=<key>`/`?key=<key>` for headerless clients. Without `BIOMETRICS_API_KEY` set, these endpoints reject every request — so a working deployment already has it configured. `/health` stays open.
+
 ### Environment Secrets
 
 All credentials (Google OAuth tokens, API keys) are stored as **Cloudflare environment secrets**, never in code.

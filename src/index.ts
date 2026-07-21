@@ -671,6 +671,20 @@ export default {
       }
     }
 
+    // MCP transports (/mcp, /sse) expose your biometric data + notification
+    // surface — require the same BIOMETRICS_API_KEY as /sync and /push. Accept
+    // it via header (validateApiKey: X-API-Key or Bearer) OR ?k=/?key= for
+    // clients that can't set headers (e.g. some SSE clients). They were open
+    // while /sync + /push were gated.
+    if (url.pathname === '/mcp' || url.pathname === '/sse') {
+      const qk = url.searchParams.get('k') || url.searchParams.get('key');
+      if (!validateApiKey(request, env) && qk !== env.BIOMETRICS_API_KEY) {
+        return new Response(JSON.stringify({ error: 'Unauthorized' }), {
+          status: 401, headers: { 'Content-Type': 'application/json', ...corsHeaders },
+        });
+      }
+    }
+
     // MCP endpoint
     if (url.pathname === '/mcp' && request.method === 'POST') {
       const body = await request.json() as McpRequest;
